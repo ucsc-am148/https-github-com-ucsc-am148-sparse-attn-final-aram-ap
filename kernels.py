@@ -211,6 +211,10 @@ def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
     Of = O.reshape(B * H, T, d)
     Lf = L.reshape(B * H, T)
 
+    # Bigger tiles need more warps to hide their longer matmul/load latency; the
+    # 64x64 tile is fastest with 4
+    num_warps = 8 if BLOCK_Q >= 128 else 4
+
     # One program per (query block, head-plane)
     grid = (T // BLOCK_Q, B * H)
     _sparse_flash_fwd_kernel[grid](
@@ -221,7 +225,7 @@ def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
         Qf.stride(0), Qf.stride(1), Qf.stride(2),
         Lf.stride(0), Lf.stride(1),
         BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, D=d,
-        num_warps=4, num_stages=2,
+        num_warps=num_warps, num_stages=2,
     )
     return O, L
 
@@ -400,6 +404,8 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     dKf = dK.reshape(B * H, T, d)
     dVf = dV.reshape(B * H, T, d)
 
+    num_warps = 8 if BLOCK_K >= 128 else 4
+
     # dK, dV
     grid_kv = (T // BLOCK_K, B * H)
     _sparse_flash_bwd_dkdv_kernel[grid_kv](
@@ -410,7 +416,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
         Qf.stride(0), Qf.stride(1), Qf.stride(2),
         Lf.stride(0), Lf.stride(1),
         BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, D=d,
-        num_warps=4, num_stages=2,
+        num_warps=num_warps, num_stages=2,
     )
 
     # dQ
@@ -423,7 +429,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
         Qf.stride(0), Qf.stride(1), Qf.stride(2),
         Lf.stride(0), Lf.stride(1),
         BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, D=d,
-        num_warps=4, num_stages=2,
+        num_warps=num_warps, num_stages=2,
     )
 
     return dQ, dK, dV
