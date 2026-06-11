@@ -228,13 +228,13 @@ def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
 
 @triton.jit
 def _sparse_flash_bwd_dkdv_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr, dO_ptr, dK_ptr, dV_ptr,
+    Q_ptr, K_ptr, V_ptr, Delta_ptr, L_ptr, dO_ptr, dK_ptr, dV_ptr,
     k_row_offsets_ptr,   # (n+1,)  int32  key-block view prefix sums
     k_col_indices_ptr,   # (nnz,)  int32  query blocks i that attend each key block j
     sm_scale,
     T,
-    stride_z, stride_t, stride_d,   # shared (B*H, T, d) layout for Q/K/V/O/dO/dK/dV
-    stride_lz, stride_lt,           # (B*H, T) layout for L
+    stride_z, stride_t, stride_d,   # shared (B*H, T, d) layout for Q/K/V/dO/dK/dV
+    stride_lz, stride_lt,           # (B*H, T) layout for L and Delta
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     D: tl.constexpr,
@@ -269,11 +269,11 @@ def _sparse_flash_bwd_dkdv_kernel(
 
         q_ptrs = Q_ptr + qkv_base + offs_qi[:, None] * stride_t + offs_d[None, :] * stride_d
         do_ptrs = dO_ptr + qkv_base + offs_qi[:, None] * stride_t + offs_d[None, :] * stride_d
-        o_ptrs = O_ptr + qkv_base + offs_qi[:, None] * stride_t + offs_d[None, :] * stride_d
         q_i = tl.load(q_ptrs, mask=qi_mask[:, None], other=0.0)
         do_i = tl.load(do_ptrs, mask=qi_mask[:, None], other=0.0)
-        o_i = tl.load(o_ptrs, mask=qi_mask[:, None], other=0.0)
         l_i = tl.load(L_ptr + pid_z * stride_lz + offs_qi * stride_lt,
+                      mask=qi_mask, other=0.0)
+        D_i = tl.load(Delta_ptr + pid_z * stride_lz + offs_qi * stride_lt,
                       mask=qi_mask, other=0.0)
 
         # P_ij = exp2(LOG2E * sm_scale * Q_i.K_j^T - L_i)   (BLOCK_Q, BLOCK_K)
@@ -284,8 +284,6 @@ def _sparse_flash_bwd_dkdv_kernel(
         # dV_j += P^T @ dO_i
         dv += tl.dot(tl.trans(p).to(do_i.dtype), do_i, allow_tf32=False)
 
-        # D_i = rowsum(dO_i ⊙ O_i)            (BLOCK_Q,)
-        D_i = tl.sum(do_i.to(tl.float32) * o_i.to(tl.float32), 1)
         # dP_ij = dO_i @ V_j^T                (BLOCK_Q, BLOCK_K)
         dp = tl.dot(do_i, tl.trans(v_j), allow_tf32=False)
         # dS_ij = P_ij * (dP_ij - D_i)
@@ -303,7 +301,7 @@ def _sparse_flash_bwd_dkdv_kernel(
 
 @triton.jit
 def _sparse_flash_bwd_dq_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr, dO_ptr, dQ_ptr,
+    Q_ptr, K_ptr, V_ptr, Delta_ptr, L_ptr, dO_ptr, dQ_ptr,
     q_row_offsets_ptr,   # (n+1,)  int32  query-block view prefix sums
     q_col_indices_ptr,   # (nnz,)  int32  live key blocks j per query block i
     sm_scale,
@@ -327,15 +325,12 @@ def _sparse_flash_bwd_dq_kernel(
 
     q_ptrs = Q_ptr + qkv_base + offs_q[:, None] * stride_t + offs_d[None, :] * stride_d
     do_ptrs = dO_ptr + qkv_base + offs_q[:, None] * stride_t + offs_d[None, :] * stride_d
-    o_ptrs = O_ptr + qkv_base + offs_q[:, None] * stride_t + offs_d[None, :] * stride_d
     q_i = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
     do_i = tl.load(do_ptrs, mask=q_mask[:, None], other=0.0)
-    o_i = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0)
     l_i = tl.load(L_ptr + pid_z * stride_lz + offs_q * stride_lt,
                   mask=q_mask, other=0.0)
-
-    # D_i = rowsum(dO_i ⊙ O_i)
-    D_i = tl.sum(do_i.to(tl.float32) * o_i.to(tl.float32), 1)
+    D_i = tl.load(Delta_ptr + pid_z * stride_lz + offs_q * stride_lt,
+                  mask=q_mask, other=0.0)
 
     dq = tl.zeros((BLOCK_Q, D), dtype=tl.float32)
 
@@ -392,9 +387,11 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     Qf = Q.reshape(B * H, T, d)
     Kf = K.reshape(B * H, T, d)
     Vf = V.reshape(B * H, T, d)
-    Of = O.reshape(B * H, T, d)
     dOf = dO.reshape(B * H, T, d)
     Lf = L.reshape(B * H, T)
+
+    Delta = (dO.to(torch.float32) * O.to(torch.float32)).sum(-1)   # (B, H, T) fp32
+    Deltaf = Delta.reshape(B * H, T)
 
     dQ = torch.empty_like(Q)
     dK = torch.empty_like(K)
@@ -406,7 +403,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     # dK, dV
     grid_kv = (T // BLOCK_K, B * H)
     _sparse_flash_bwd_dkdv_kernel[grid_kv](
-        Qf, Kf, Vf, Of, Lf, dOf, dKf, dVf,
+        Qf, Kf, Vf, Deltaf, Lf, dOf, dKf, dVf,
         k_row_offsets, k_col_indices,
         sm_scale,
         T,
@@ -419,7 +416,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     # dQ
     grid_q = (T // BLOCK_Q, B * H)
     _sparse_flash_bwd_dq_kernel[grid_q](
-        Qf, Kf, Vf, Of, Lf, dOf, dQf,
+        Qf, Kf, Vf, Deltaf, Lf, dOf, dQf,
         q_row_offsets, q_col_indices,
         sm_scale,
         T,
